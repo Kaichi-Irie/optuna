@@ -19,15 +19,15 @@ random.seed(42)
 # %%
 def solve_stacking(x0s) -> dict:
     assert x0s.ndim == 2, "x0s should be a 2D array"
-    num_opt, dimension = x0s.shape
-    assert num_opt > 0, "num_opt should be greater than 0"
+    batch_size, dimension = x0s.shape
+    assert batch_size > 0, "batch_size should be greater than 0"
     assert dimension > 0, "D should be greater than 0"
     R = np.eye(dimension)
-    bounds = [(-5, 5)] * dimension * num_opt
+    bounds = [(-5, 5)] * dimension * batch_size
 
     print("x0s.shape:", x0s.shape)
     tensor_benchmark = TensorOperationsBenchmark(
-        n_trials=300, dimension=dimension, batch_size=num_opt
+        n_trials=300, dimension=dimension, batch_size=batch_size
     )
 
     start = time.time()
@@ -35,7 +35,7 @@ def solve_stacking(x0s) -> dict:
         func=vectorized_f19,
         x0=x0s.flatten(),
         fprime=vectorized_f19_grad,
-        args=(R, num_opt, dimension, tensor_benchmark),
+        args=(R, batch_size, dimension, tensor_benchmark),
         bounds=bounds,
         # maxiter=200,
         # maxiter=150_000,
@@ -46,14 +46,14 @@ def solve_stacking(x0s) -> dict:
     print(
         "Time taken:",
         elapsed,
-        f"Optimization result with {dimension=}, {num_opt=}:",
+        f"Optimization result with {dimension=}, {batch_size=}:",
         res,
     )
 
     x_opts, sum_f_opt, res_dict = res
-    x_opts = x_opts.reshape(num_opt, dimension)
+    x_opts = x_opts.reshape(batch_size, dimension)
     check_sum = 0.0
-    for i in range(num_opt):
+    for i in range(batch_size):
         f_opt = f19(x_opts[i], R)
         print(f"Starting Point: {x0s[i]}, Optimal x: {x_opts[i]}, Optimal f: {f_opt}")
         check_sum += f_opt
@@ -85,24 +85,24 @@ def save_jsonl(results: list[dict], filename="results.jsonl"):
 
 # %%
 if __name__ == "__main__":
-    num_opts = [1]  # , 3, 5]  # , 10, 30, 100]
+    batch_sizes = [1]  # , 3, 5]  # , 10, 30, 100]
     dimensions = [5, 10, 30, 50]
     results = []
     elapsed_times_stacking = []
 
-    for num_opt, dimension in itertools.product(num_opts, dimensions):
-        print(f"Solving with {num_opt=} and {dimension=}...")
-        x0s = np.random.uniform(-5, 5, size=(num_opt, dimension))
+    for batch_size, dimension in itertools.product(batch_sizes, dimensions):
+        print(f"Solving with {batch_size=} and {dimension=}...")
+        x0s = np.random.uniform(-5, 5, size=(batch_size, dimension))
         result_st = solve_stacking(x0s)
-        print(f"Results for {num_opt=} and {dimension=}: {result_st}")
+        print(f"Results for {batch_size=} and {dimension=}: {result_st}")
         print(
-            f"number of iterations: {result_st['nit']}, function evaluations: {result_st['funcalls']}, funcalls per num_opt: {result_st['funcalls'] / num_opt if num_opt > 0 else 0:.2f}"
+            f"number of iterations: {result_st['nit']}, function evaluations: {result_st['funcalls']}, funcalls per batch_size: {result_st['funcalls'] / batch_size if batch_size > 0 else 0:.2f}"
         )
         print("Best Results (Stacking):", np.min(result_st["f_opts"]))
         elapsed_times_stacking.append(result_st["elapsed"])
 
         result = {
-            "num_opt": num_opt,
+            "batch_size": batch_size,
             "dimension": dimension,
             "best_f_opts": min(result_st["f_opts"]),
             "elapsed (sec)": result_st["elapsed"],

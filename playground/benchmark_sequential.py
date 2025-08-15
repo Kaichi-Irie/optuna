@@ -20,13 +20,13 @@ def solve(x0: np.ndarray, tensor_benchmark: TensorOperationsBenchmark | None):
     dimension = len(x0)
     bounds = [(-5, 5)] * dimension
     R = np.eye(dimension)  # For simplicity, use identity matrix
-    num_opt = 1  # Single optimization problem
+    batch_size = 1  # Single optimization problem
     x_opt, f_opt, res_dict = opt.fmin_l_bfgs_b(
         func=vectorized_f19,
         x0=x0,
         fprime=vectorized_f19_grad,
         bounds=bounds,
-        args=(R, num_opt, dimension, tensor_benchmark),
+        args=(R, batch_size, dimension, tensor_benchmark),
         # maxiter=200,
     )
     # z_opt = compute_z_from_x(x_opt, R)
@@ -38,8 +38,8 @@ def solve(x0: np.ndarray, tensor_benchmark: TensorOperationsBenchmark | None):
 
 def solve_sequential(x0s) -> dict:
     assert x0s.ndim == 2, "x0s should be a 2D array"
-    num_opt, dimension = x0s.shape
-    assert num_opt > 0, "num_opt should be greater than 0"
+    batch_size, dimension = x0s.shape
+    assert batch_size > 0, "batch_size should be greater than 0"
     assert dimension > 0, "D should be greater than 0"
     x_opts = []
     f_opts = []
@@ -80,20 +80,20 @@ def save_jsonl(results: list[dict], filename="results.jsonl"):
 
 
 if __name__ == "__main__":
-    num_opts = [1]
+    batch_sizes = [1]
     dimensions = [10]
     results = []
     elapsed_times_sequential = []
-    for num_opt, dimension in itertools.product(num_opts, dimensions):
-        print(f"Solving with {num_opt=} and {dimension=}...")
-        x0s = np.random.uniform(-5, 5, size=(num_opt, dimension))
+    for batch_size, dimension in itertools.product(batch_sizes, dimensions):
+        print(f"Solving with {batch_size=} and {dimension=}...")
+        x0s = np.random.uniform(-5, 5, size=(batch_size, dimension))
         result_seq = solve_sequential(x0s)
 
-        print(f"Results for {num_opt=} and {dimension=}: {result_seq}")
+        print(f"Results for {batch_size=} and {dimension=}: {result_seq}")
         print("Best Results (Sequential):", np.min(result_seq["f_opts"]))
         elapsed_times_sequential.append(result_seq["elapsed"])
         result = {
-            "num_opt": num_opt,
+            "batch_size": batch_size,
             "dimension": dimension,
             "best_f_opts": min(result_seq["f_opts"]),
             "elapsed (sec)": result_seq["elapsed"],
