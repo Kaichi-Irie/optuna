@@ -1,13 +1,15 @@
 # %%
+import itertools
+import json
 import random
 import time
 
 import numpy as np
 import scipy.optimize as opt
 import torch
-
-from playground.f19 import f19
-from playground.vectorized_f19 import vectorized_f19, vectorized_f19_grad
+from benchmark_tensor_operations import TensorOperationsBenchmark
+from f19 import f19
+from vectorized_f19 import vectorized_f19, vectorized_f19_grad
 
 np.random.seed(42)
 torch.manual_seed(42)
@@ -17,36 +19,42 @@ random.seed(42)
 # %%
 def solve_stacking(x0s) -> dict:
     assert x0s.ndim == 2, "x0s should be a 2D array"
-    num_opt, D = x0s.shape
+    num_opt, dimension = x0s.shape
     assert num_opt > 0, "num_opt should be greater than 0"
-    assert D > 0, "D should be greater than 0"
-    R = np.eye(D)
-    bounds = [(-5, 5)] * D * num_opt
+    assert dimension > 0, "D should be greater than 0"
+    R = np.eye(dimension)
+    bounds = [(-5, 5)] * dimension * num_opt
 
     print("x0s.shape:", x0s.shape)
+    tensor_benchmark = TensorOperationsBenchmark(
+        n_trials=300, dimension=dimension, batch_size=num_opt
+    )
+
     start = time.time()
     res = opt.fmin_l_bfgs_b(
         func=vectorized_f19,
-        x0=x0s.ravel(),
+        x0=x0s.flatten(),
         fprime=vectorized_f19_grad,
-        args=(R, num_opt, D),
+        args=(R, num_opt, dimension, tensor_benchmark),
         bounds=bounds,
-        maxiter=200,
+        # maxiter=200,
+        # maxiter=150_000,
         # maxfun=150_000,
+        # m=100,
     )
     elapsed = time.time() - start
     print(
         "Time taken:",
         elapsed,
-        f"Optimization result with {D=}, {num_opt=}:",
+        f"Optimization result with {dimension=}, {num_opt=}:",
         res,
     )
 
     x_opts, sum_f_opt, res_dict = res
-    x_opts = x_opts.reshape(num_opt, D)
+    x_opts = x_opts.reshape(num_opt, dimension)
     check_sum = 0.0
     for i in range(num_opt):
-        f_opt = f19(x_opts[i], R, enable_torch_computations=False)
+        f_opt = f19(x_opts[i], R)
         print(f"Starting Point: {x0s[i]}, Optimal x: {x_opts[i]}, Optimal f: {f_opt}")
         check_sum += f_opt
 
@@ -54,9 +62,10 @@ def solve_stacking(x0s) -> dict:
 
     result = {
         "x_opts": x_opts,
-        "f_opts": [f19(x, R, enable_torch_computations=False) for x in x_opts],
+        "f_opts": [f19(x, R) for x in x_opts],
         "elapsed": elapsed,
     }
+    print("Result Keys:", res_dict.keys())
     for key, value in res_dict.items():
         result[key] = value
     print(
@@ -66,24 +75,41 @@ def solve_stacking(x0s) -> dict:
 
 
 # %%
+
+
+def save_jsonl(results: list[dict], filename="results.jsonl"):
+    with open(filename, "w") as f:
+        for result in results:
+            f.write(json.dumps(result) + "\n")
+
+
+# %%
 if __name__ == "__main__":
-    num_opts = [2]
-    dimensions = [10]
-    MULTI_PROCESSING = False
-    results_stacking = []
+    num_opts = [1]  # , 3, 5]  # , 10, 30, 100]
+    dimensions = [5, 10, 30, 50]
+    results = []
     elapsed_times_stacking = []
 
-    for num_opt in num_opts:
-        for dimension in dimensions:
-            print(f"Solving with {num_opt=} and {dimension=}...")
-            x0s = np.random.uniform(-5, 5, size=(num_opt, dimension))
-            result_st = solve_stacking(x0s)
-            results_stacking.append(result_st)
-            print(f"Results for {num_opt=} and {dimension=}: {result_st}")
-            print(
-                f"number of iterations: {result_st['nit']}, function evaluations: {result_st['funcalls']}, funcalls per num_opt: {result_st['funcalls'] / num_opt if num_opt > 0 else 0:.2f}"
-            )
-            print("Best Results (Stacking):", np.min(result_st["f_opts"]))
-            elapsed_times_stacking.append(result_st["elapsed"])
+    for num_opt, dimension in itertools.product(num_opts, dimensions):
+        print(f"Solving with {num_opt=} and {dimension=}...")
+        x0s = np.random.uniform(-5, 5, size=(num_opt, dimension))
+        result_st = solve_stacking(x0s)
+        print(f"Results for {num_opt=} and {dimension=}: {result_st}")
+        print(
+            f"number of iterations: {result_st['nit']}, function evaluations: {result_st['funcalls']}, funcalls per num_opt: {result_st['funcalls'] / num_opt if num_opt > 0 else 0:.2f}"
+        )
+        print("Best Results (Stacking):", np.min(result_st["f_opts"]))
+        elapsed_times_stacking.append(result_st["elapsed"])
+
+        result = {
+            "num_opt": num_opt,
+            "dimension": dimension,
+            "best_f_opts": min(result_st["f_opts"]),
+            "elapsed (sec)": result_st["elapsed"],
+            "nit": result_st["nit"],
+            "funcalls": result_st["funcalls"],
+        }
+        results.append(result)
 
     print("Elapsed Times (Stacking):", elapsed_times_stacking)
+    save_jsonl(results, "results_stacking.jsonl")

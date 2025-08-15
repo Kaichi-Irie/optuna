@@ -1,33 +1,41 @@
 import math
 
 import numpy as np
-import torch
+from benchmark_tensor_operations import TensorOperationsBenchmark
 
 
-def f19(x: np.ndarray, R: np.ndarray, enable_torch_computations=True) -> float:
-    D = len(x)
-    if D < 2:
+def f19(
+    x: np.ndarray,
+    R: np.ndarray,
+    tensor_benchmark: TensorOperationsBenchmark | None = None,
+) -> float:
+    dimension = len(x)
+    if dimension < 2:
         raise ValueError("D must be greater than 1")
 
     # R = np.eye(D)  # For simplicity, use identity matrix
-    s = np.zeros(D - 1)
-    z = max(1, math.sqrt(D) / 8.0) * (R @ x) + 0.5
-    for i in range(D - 1):
+    s = np.zeros(dimension - 1)
+    z = max(1, math.sqrt(dimension) / 8.0) * (R @ x) + 0.5
+    for i in range(dimension - 1):
         s[i] = 100.0 * (z[i] ** 2 - z[i + 1]) ** 2 + (z[i] - 1) ** 2
-    if enable_torch_computations:
-        torch.randn(300, 300) @ torch.randn(300, 300)  # some operation
+    if tensor_benchmark:
+        tensor_benchmark.execute()
 
-    return 10.0 / (D - 1) * np.sum(s / 4000.0 - np.cos(s)) + 10.0
+    return 10.0 / (dimension - 1) * np.sum(s / 4000.0 - np.cos(s)) + 10.0
 
 
-def f19_grad(x: np.ndarray, R: np.ndarray) -> np.ndarray:
-    D = len(x)
-    if D < 2:
+def f19_grad(
+    x: np.ndarray,
+    R: np.ndarray,
+    tensor_benchmark: TensorOperationsBenchmark | None = None,
+) -> np.ndarray:
+    dimension = len(x)
+    if dimension < 2:
         raise ValueError("次元Dは2以上である必要があります。")
 
     # R = np.eye(D)  # For simplicity, use identity matrix
     # ステップ1: 中間変数 z の計算
-    c = max(1.0, np.sqrt(D) / 8.0)
+    c = max(1.0, np.sqrt(dimension) / 8.0)
     z = c * (R @ x) + 0.5
 
     # ステップ2: 中間変数 s の計算
@@ -42,10 +50,10 @@ def f19_grad(x: np.ndarray, R: np.ndarray) -> np.ndarray:
     s = 100 * (term1_rosen**2) + (term2_rosen**2)
 
     # ステップ3: f19 の s に関する偏微分 (df/ds) の計算
-    df_ds = (10.0 / (D - 1)) * (1.0 / 4000.0 + np.sin(s))
+    df_ds = (10.0 / (dimension - 1)) * (1.0 / 4000.0 + np.sin(s))
 
     # ステップ4: f19 の z に関する偏微分 (df/dz) の計算
-    df_dz = np.zeros(D)
+    df_dz = np.zeros(dimension)
 
     # ds_i/dz_i の計算 (訂正後の式を反映)
     dsi_dzi = 400 * z_i * term1_rosen + 2 * term2_rosen
