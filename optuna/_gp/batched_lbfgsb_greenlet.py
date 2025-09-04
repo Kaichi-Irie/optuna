@@ -4,7 +4,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import scipy.optimize as so
-from greenlet import greenlet
+
+from optuna._imports import try_import
+
+with try_import() as _imports:
+    from greenlet import greenlet
 
 if TYPE_CHECKING:
     from typing import Protocol
@@ -16,7 +20,7 @@ if TYPE_CHECKING:
             raise NotImplementedError
 
 
-def batched_lbfgsb(
+def _batched_lbfgsb(
     func_and_grad: FuncAndGrad,
     x0_batched: np.ndarray,
     bounds: np.ndarray | None = None,
@@ -104,3 +108,65 @@ def batched_lbfgsb(
     fval_opts = np.array(fval_opts)
     n_iterations = np.array(n_iterations)
     return x_opts, fval_opts, n_iterations
+
+
+def batched_lbfgsb(
+    func_and_grad: FuncAndGrad,
+    x0_batched: np.ndarray,
+    bounds: np.ndarray | None = None,
+    m: int = 10,
+    factr: float = 1e7,
+    pgtol: float = 1e-5,
+    max_evals: int = 15000,
+    max_iters: int = 15000,
+    max_line_search: int = 20,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def func_and_grad_1D_wrapper(scaled_x: np.ndarray) -> tuple[float, np.ndarray]:
+        """A wrapper for `func_and_grad` to handle 1D inputs.
+
+        This is used as a fallback to sequential optimization when the batched
+        L-BFGS-B is not available. It adapts the batched `func_and_grad` for
+        use with optimizers like `scipy.optimize.fmin_l_bfgs_b` that expect
+        a 1D input array.
+        """
+        assert scaled_x.ndim == 1
+        unconverged_batch_indices = np.array([0])
+        fval, grad = func_and_grad(scaled_x[None], unconverged_batch_indices)
+        return fval.item(), grad.ravel()
+
+    if _imports.is_successful():
+        scaled_cont_x_opts, neg_fval_opts, n_iterations = _batched_lbfgsb(
+            func_and_grad=func_and_grad,
+            x0_batched=x0_batched,
+            bounds=bounds,
+            m=m,
+            factr=factr,
+            pgtol=pgtol,
+            max_evals=max_evals,
+            max_iters=max_iters,
+            max_line_search=max_line_search,
+        )
+
+    # fallback to sequential optimization if SciPy version is not supported
+    else:
+        scaled_cont_x_opts, neg_fval_opts, n_iterations = [], [], []
+        for x0 in x0_batched:
+            scaled_cont_x_opt, neg_fval_opt, info = so.fmin_l_bfgs_b(
+                func=func_and_grad_1D_wrapper,
+                x0=x0,
+                bounds=bounds,
+                m=m,
+                factr=factr,
+                pgtol=pgtol,
+                maxfun=max_evals,
+                maxiter=max_iters,
+                maxls=max_line_search,
+            )
+            scaled_cont_x_opts.append(scaled_cont_x_opt)
+            neg_fval_opts.append(neg_fval_opt)
+            n_iterations.append(info["nit"])
+        scaled_cont_x_opts = np.array(scaled_cont_x_opts)
+        neg_fval_opts = np.array(neg_fval_opts)
+        n_iterations = np.array(n_iterations)
+
+    return scaled_cont_x_opts, neg_fval_opts, n_iterations
