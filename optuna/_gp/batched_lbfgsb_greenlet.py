@@ -1,5 +1,3 @@
-# %%
-
 import numpy as np
 import scipy.optimize as so
 from greenlet import greenlet
@@ -8,9 +6,13 @@ from greenlet import greenlet
 def batched_lbfgsb(
     func_and_grad,
     x0_batched: np.ndarray,
-    bounds: np.ndarray,
-    pgtol: float,
-    max_iters: int,
+    bounds: np.ndarray | None = None,
+    m: int = 10,
+    factr: float = 1e7,
+    pgtol: float = 1e-5,
+    max_evals: int = 15000,
+    max_iters: int = 15000,
+    max_line_search: int = 20,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     assert x0_batched.ndim == 2
     batch_size, dimension = x0_batched.shape
@@ -34,8 +36,12 @@ def batched_lbfgsb(
             func=func,
             x0=x0_batched[i],
             bounds=bounds,
+            m=m,
+            factr=factr,
             pgtol=pgtol,
+            maxfun=max_evals,
             maxiter=max_iters,
+            maxls=max_line_search,
             iprint=-1,
         )
         x_opts[i] = x_opt
