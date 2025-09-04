@@ -1,10 +1,23 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 import scipy.optimize as so
 from greenlet import greenlet
 
+if TYPE_CHECKING:
+    from typing import Protocol
+
+    class FuncAndGrad(Protocol):
+        def __call__(
+            self, x: np.ndarray, unconverged_batch_indices: np.ndarray
+        ) -> tuple[np.ndarray, np.ndarray]:
+            raise NotImplementedError
+
 
 def batched_lbfgsb(
-    func_and_grad,
+    func_and_grad: FuncAndGrad,
     x0_batched: np.ndarray,
     bounds: np.ndarray | None = None,
     m: int = 10,
