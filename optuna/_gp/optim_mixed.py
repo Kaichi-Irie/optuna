@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import greenlet
 import numpy as np
 import torch
 
-from optuna._gp.batched_lbfgsb_greenlet import batched_lbfgsb
+from optuna._gp.acqf import BaseAcquisitionFunc
 from optuna._gp.scipy_blas_thread_patch import single_blas_thread_if_scipy_v1_15_or_newer
 from optuna.logging import get_logger
 
@@ -22,14 +23,35 @@ else:
 _logger = get_logger(__name__)
 
 
-def _gradient_ascent_batched(
+class BatchEvaluatedAcquisitionFunc(BaseAcquisitionFunc):
+    def __init__(self, underlying_acquisition_func: BaseAcquisitionFunc) -> None:
+        super().__init__(
+            underlying_acquisition_func.length_scales,
+            underlying_acquisition_func.search_space,
+        )
+        self._underlying_acquisition_func = underlying_acquisition_func
+
+    def eval_acqf(self, x: "torch.Tensor") -> "torch.Tensor":
+        raise NotImplementedError(
+            "BatchEvaluatedAcquisitionFunc.eval_acqf is not implemented. "
+            "Please use eval_acqf_no_grad or eval_acqf_with_grad."
+        )
+
+    def eval_acqf_no_grad(self, x: np.ndarray) -> np.ndarray:
+        return greenlet.getcurrent().parent.switch((False, x))
+
+    def eval_acqf_with_grad(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return greenlet.getcurrent().parent.switch((True, x))
+
+
+def _gradient_ascent(
     acqf: BaseAcquisitionFunc,
-    initial_params_batched: np.ndarray,
-    initial_fvals: np.ndarray,
+    initial_params: np.ndarray,
+    initial_fval: float,
     continuous_indices: np.ndarray,
     lengthscales: np.ndarray,
     tol: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, float, bool]:
     """
     This function optimizes the acquisition function using preconditioning.
     Preconditioning equalizes the variances caused by each parameter and
@@ -46,52 +68,95 @@ def _gradient_ascent_batched(
     As the domain of `x` is [0, 1], that of `z` becomes [0, 1/l].
     """
     if len(continuous_indices) == 0:
-        return initial_params_batched, initial_fvals, np.array([False] * len(initial_fvals))
-    normalized_params = initial_params_batched.copy()
+        return initial_params, initial_fval, False
+    normalized_params = initial_params.copy()
 
-    # TODO: rename unconverged_batch_indices to clearer name
-    def negative_acqf_with_grad(
-        scaled_x: np.ndarray, unconverged_batch_indices: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def negative_acqf_with_grad(scaled_x: np.ndarray) -> tuple[float, np.ndarray]:
         # Scale back to the original domain, i.e. [0, 1], from [0, 1/s].
-        assert scaled_x.ndim == 2
-        normalized_params[np.ix_(unconverged_batch_indices, continuous_indices)] = (
-            scaled_x * lengthscales
-        )
-        x_tensor = torch.from_numpy(
-            normalized_params[unconverged_batch_indices, :]
-        ).requires_grad_(True)
-        neg_fvals = -acqf.eval_acqf(x_tensor)
-        neg_fvals.sum().backward()
-        grads = x_tensor.grad.detach().numpy()  # type: ignore
-        neg_fvals = neg_fvals.detach().numpy()
+        normalized_params[continuous_indices] = scaled_x * lengthscales
+        (fval, grad) = acqf.eval_acqf_with_grad(normalized_params)
         # Flip sign because scipy minimizes functions.
         # Let the scaled acqf be g(x) and the acqf be f(sx), then dg/dx = df/dx * s.
-        return neg_fvals, grads[:, continuous_indices] * lengthscales
+        return -float(fval), -grad[continuous_indices] * lengthscales
 
     with single_blas_thread_if_scipy_v1_15_or_newer():
-        x0_batched = normalized_params[:, continuous_indices] / lengthscales
-        bounds = np.array([(0, 1 / s) for s in lengthscales])
-        pgtol = math.sqrt(tol)
-        max_iters = 200
-
-        scaled_cont_x_opts, neg_fval_opts, n_iterations = batched_lbfgsb(
-            func_and_grad=negative_acqf_with_grad,
-            x0_batched=x0_batched,
-            bounds=bounds,
-            pgtol=pgtol,
-            max_iters=max_iters,
+        scaled_cont_x_opt, neg_fval_opt, info = so.fmin_l_bfgs_b(
+            func=negative_acqf_with_grad,
+            x0=normalized_params[continuous_indices] / lengthscales,
+            bounds=[(0, 1 / s) for s in lengthscales],
+            pgtol=math.sqrt(tol),
+            maxiter=200,
         )
 
-    normalized_params[:, continuous_indices] = scaled_cont_x_opts * lengthscales
+    if -neg_fval_opt > initial_fval and info["nit"] > 0:  # Improved.
+        # `nit` is the number of iterations.
+        normalized_params[continuous_indices] = scaled_cont_x_opt * lengthscales
+        return normalized_params, -neg_fval_opt, True
 
-    # If any parameter is updated, return the updated parameters and values. Otherwise, return the initial ones.
-    is_updated_batch = (-neg_fval_opts > initial_fvals) & (n_iterations > 0)
-    final_params = initial_params_batched.copy()
-    final_params[is_updated_batch, :] = normalized_params[is_updated_batch, :]
-    final_fvals = initial_fvals.copy()
-    final_fvals[is_updated_batch] = -neg_fval_opts[is_updated_batch]
-    return final_params, final_fvals, is_updated_batch
+    return initial_params, initial_fval, False  # No improvement.
+
+
+def _gradient_ascent_batched(
+    acqf: BaseAcquisitionFunc,
+    initial_params_batched: np.ndarray,
+    initial_fvals: np.ndarray,
+    continuous_indices: np.ndarray,
+    lengthscales: np.ndarray,
+    tol: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    batch_size, dim = initial_params_batched.shape
+
+    def optimize_task_factory(
+        x0: np.ndarray,
+        initial_fval: float,
+    ) -> typing.Callable[[float], tuple[np.ndarray, float, bool]]:
+        def optimize_task(_y0: float) -> tuple[np.ndarray, float, bool]:
+            return _gradient_ascent(
+                BatchEvaluatedAcquisitionFunc(acqf),
+                x0,
+                initial_fval,
+                continuous_indices,
+                lengthscales,
+                tol,
+            )
+
+        return optimize_task
+
+    optimize_greenlets = [
+        greenlet.greenlet(optimize_task_factory(initial_params_batched[i], initial_fvals[i]))
+        for i in range(batch_size)
+    ]
+
+    active_tasks = list(range(batch_size))
+
+    final_fvals = np.full(batch_size, np.nan)
+    final_xs = np.full((batch_size, dim), np.nan)
+    is_updated_batch = np.zeros(batch_size, dtype=np.bool_)
+    fvals = np.full(batch_size, np.nan)
+    grads = np.full((batch_size, dim), np.nan)
+    xs = np.full((batch_size, dim), np.nan)
+    requires_grad = np.zeros(batch_size, dtype=np.bool_)
+    while True:
+        for i in range(len(active_tasks) - 1, -1, -1):
+            task_i = active_tasks[i]
+            if requires_grad[i]:
+                res = optimize_greenlets[task_i].switch(fvals[i], grads[i])
+            else:
+                res = optimize_greenlets[task_i].switch(fvals[i])
+            if optimize_greenlets[task_i].dead:
+                final_xs[task_i], final_fvals[task_i], is_updated_batch[task_i] = res
+                active_tasks[i] = active_tasks[-1]
+                active_tasks.pop()
+                if len(active_tasks) == 0:
+                    return (np.array(final_xs), np.array(final_fvals), np.array(is_updated_batch))
+            else:
+                requires_grad[i], xs[i] = res
+
+        # TODO(contramundum53): Can be made smarter
+        if np.any(requires_grad[: len(active_tasks)]):
+            fvals, grads = acqf.eval_acqf_with_grad(xs[: len(active_tasks)])
+        else:
+            fvals = acqf.eval_acqf_no_grad(xs[: len(active_tasks)])
 
 
 def _exhaustive_search(

@@ -1,33 +1,30 @@
 from __future__ import annotations
 
-from typing import Any
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 import optuna
-from optuna._experimental import experimental_class
-from optuna._experimental import warn_experimental_argument
-from optuna.samplers._base import _CONSTRAINTS_KEY
-from optuna.samplers._base import _INDEPENDENT_SAMPLING_WARNING_TEMPLATE
-from optuna.samplers._base import _process_constraints_after_trial
-from optuna.samplers._base import BaseSampler
+from optuna._experimental import experimental_class, warn_experimental_argument
+from optuna.samplers._base import (
+    _CONSTRAINTS_KEY,
+    _INDEPENDENT_SAMPLING_WARNING_TEMPLATE,
+    BaseSampler,
+    _process_constraints_after_trial,
+)
 from optuna.samplers._lazy_random_state import LazyRandomState
 from optuna.study import StudyDirection
 from optuna.study._multi_objective import _is_pareto_front
-from optuna.trial import FrozenTrial
-from optuna.trial import TrialState
-
+from optuna.trial import FrozenTrial, TrialState
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     import torch
 
     import optuna._gp.acqf as acqf_module
     import optuna._gp.gp as gp
-    import optuna._gp.optim_mixed as optim_mixed
+    import optuna._gp.optim_mixed_batched as optim_mixed_batched
     import optuna._gp.prior as prior
     import optuna._gp.search_space as gp_search_space
     from optuna.distributions import BaseDistribution
@@ -38,12 +35,11 @@ else:
     torch = _LazyImport("torch")
     gp_search_space = _LazyImport("optuna._gp.search_space")
     gp = _LazyImport("optuna._gp.gp")
-    optim_mixed = _LazyImport("optuna._gp.optim_mixed")
+    optim_mixed_batched = _LazyImport("optuna._gp.optim_mixed_batched")
     acqf_module = _LazyImport("optuna._gp.acqf")
     prior = _LazyImport("optuna._gp.prior")
 
 import logging
-
 
 _logger = logging.getLogger(__name__)
 
@@ -218,7 +214,7 @@ class GPSampler(BaseSampler):
         # However, we do not make any effort to keep backward compatibility between versions.
         # Particularly, we may remove this function in future refactoring.
         assert best_params is None or len(best_params.shape) == 2
-        normalized_params, _acqf_val = optim_mixed.optimize_acqf_mixed(
+        normalized_params, _acqf_val = optim_mixed_batched.optimize_acqf_mixed_batch(
             acqf,
             warmstart_normalized_params_array=best_params,
             n_preliminary_samples=self._n_preliminary_samples,
