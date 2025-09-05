@@ -3,11 +3,13 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import greenlet
 import numpy as np
+import torch
 
+from optuna._gp.acqf import BaseAcquisitionFunc
 from optuna._gp.scipy_blas_thread_patch import single_blas_thread_if_scipy_v1_15_or_newer
 from optuna.logging import get_logger
-
 
 if TYPE_CHECKING:
     import scipy.optimize as so
@@ -19,6 +21,27 @@ else:
     so = _LazyImport("scipy.optimize")
 
 _logger = get_logger(__name__)
+
+
+class BatchEvaluatedAcquisitionFunc(BaseAcquisitionFunc):
+    def __init__(self, underlying_acquisition_func: BaseAcquisitionFunc) -> None:
+        super().__init__(
+            underlying_acquisition_func.length_scales,
+            underlying_acquisition_func.search_space,
+        )
+        self._underlying_acquisition_func = underlying_acquisition_func
+
+    def eval_acqf(self, x: "torch.Tensor") -> "torch.Tensor":
+        raise NotImplementedError(
+            "BatchEvaluatedAcquisitionFunc.eval_acqf is not implemented. "
+            "Please use eval_acqf_no_grad or eval_acqf_with_grad."
+        )
+
+    def eval_acqf_no_grad(self, x: np.ndarray) -> np.ndarray:
+        return greenlet.getcurrent().parent.switch((False, x))
+
+    def eval_acqf_with_grad(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return greenlet.getcurrent().parent.switch((True, x))
 
 
 def _gradient_ascent(
@@ -54,7 +77,7 @@ def _gradient_ascent(
         (fval, grad) = acqf.eval_acqf_with_grad(normalized_params)
         # Flip sign because scipy minimizes functions.
         # Let the scaled acqf be g(x) and the acqf be f(sx), then dg/dx = df/dx * s.
-        return -fval, -grad[continuous_indices] * lengthscales
+        return -float(fval), -grad[continuous_indices] * lengthscales
 
     with single_blas_thread_if_scipy_v1_15_or_newer():
         scaled_cont_x_opt, neg_fval_opt, info = so.fmin_l_bfgs_b(
@@ -71,6 +94,69 @@ def _gradient_ascent(
         return normalized_params, -neg_fval_opt, True
 
     return initial_params, initial_fval, False  # No improvement.
+
+
+def _gradient_ascent_batched(
+    acqf: BaseAcquisitionFunc,
+    initial_params_batched: np.ndarray,
+    initial_fvals: np.ndarray,
+    continuous_indices: np.ndarray,
+    lengthscales: np.ndarray,
+    tol: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    batch_size, dim = initial_params_batched.shape
+
+    def optimize_task_factory(
+        x0: np.ndarray,
+        initial_fval: float,
+    ) -> typing.Callable[[float], tuple[np.ndarray, float, bool]]:
+        def optimize_task(_y0: float) -> tuple[np.ndarray, float, bool]:
+            return _gradient_ascent(
+                BatchEvaluatedAcquisitionFunc(acqf),
+                x0,
+                initial_fval,
+                continuous_indices,
+                lengthscales,
+                tol,
+            )
+
+        return optimize_task
+
+    optimize_greenlets = [
+        greenlet.greenlet(optimize_task_factory(initial_params_batched[i], initial_fvals[i]))
+        for i in range(batch_size)
+    ]
+
+    active_tasks = list(range(batch_size))
+
+    final_fvals = np.full(batch_size, np.nan)
+    final_xs = np.full((batch_size, dim), np.nan)
+    is_updated_batch = np.zeros(batch_size, dtype=np.bool_)
+    fvals = np.full(batch_size, np.nan)
+    grads = np.full((batch_size, dim), np.nan)
+    xs = np.full((batch_size, dim), np.nan)
+    requires_grad = np.zeros(batch_size, dtype=np.bool_)
+    while True:
+        for i in range(len(active_tasks) - 1, -1, -1):
+            task_i = active_tasks[i]
+            if requires_grad[i]:
+                res = optimize_greenlets[task_i].switch(fvals[i], grads[i])
+            else:
+                res = optimize_greenlets[task_i].switch(fvals[i])
+            if optimize_greenlets[task_i].dead:
+                final_xs[task_i], final_fvals[task_i], is_updated_batch[task_i] = res
+                active_tasks[i] = active_tasks[-1]
+                active_tasks.pop()
+                if len(active_tasks) == 0:
+                    return (np.array(final_xs), np.array(final_fvals), np.array(is_updated_batch))
+            else:
+                requires_grad[i], xs[i] = res
+
+        # TODO(contramundum53): Can be made smarter
+        if np.any(requires_grad[: len(active_tasks)]):
+            fvals, grads = acqf.eval_acqf_with_grad(xs[: len(active_tasks)])
+        else:
+            fvals = acqf.eval_acqf_no_grad(xs[: len(active_tasks)])
 
 
 def _exhaustive_search(
@@ -133,8 +219,9 @@ def _discrete_line_search(
             return np.inf
         right = int(np.clip(np.searchsorted(grids, x), 1, len(grids) - 1))
         left = right - 1
-        neg_acqf_left, neg_acqf_right = negative_acqf_with_cache(left), negative_acqf_with_cache(
-            right
+        neg_acqf_left, neg_acqf_right = (
+            negative_acqf_with_cache(left),
+            negative_acqf_with_cache(right),
         )
         w_left = (grids[right] - x) / (grids[right] - grids[left])
         w_right = 1.0 - w_left
@@ -168,7 +255,6 @@ def _local_search_discrete(
     choices: np.ndarray,
     xtol: float,
 ) -> tuple[np.ndarray, float, bool]:
-
     # If the number of possible parameter values is small, we just perform an exhaustive search.
     # This is faster and better than the line search.
     MAX_INT_EXHAUSTIVE_SEARCH_PARAMS = 16
@@ -180,15 +266,37 @@ def _local_search_discrete(
         return _discrete_line_search(acqf, initial_params, initial_fval, param_idx, choices, xtol)
 
 
-def local_search_mixed(
+def _local_search_discrete_batched(
     acqf: BaseAcquisitionFunc,
-    initial_normalized_params: np.ndarray,
+    initial_params_batched: np.ndarray,
+    initial_fvals: np.ndarray,
+    param_idx: int,
+    choices: np.ndarray,
+    xtol: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    best_normalized_params_batched = initial_params_batched.copy()
+    best_fvals = initial_fvals.copy()
+
+    is_updated_batch = np.zeros(len(initial_fvals), dtype=bool)
+    for batch, normalized_params in enumerate(initial_params_batched):
+        (best_normalized_params, best_fval, updated) = _local_search_discrete(
+            acqf, normalized_params, best_fvals[batch], param_idx, choices, xtol
+        )
+        best_normalized_params_batched[batch] = best_normalized_params
+        best_fvals[batch] = best_fval
+        is_updated_batch[batch] = updated
+
+    return best_normalized_params_batched, best_fvals, is_updated_batch
+
+
+def local_search_mixed_batched(
+    acqf: BaseAcquisitionFunc,
+    initial_normalized_params_batched: np.ndarray,
     *,
     tol: float = 1e-4,
     max_iter: int = 100,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray]:
     continuous_indices = acqf.search_space.continuous_indices
-
     # This is a technique for speeding up optimization.
     # We use an isotropic kernel, so scaling the gradient will make
     # the hessian better-conditioned.
@@ -196,7 +304,6 @@ def local_search_mixed(
     # but for simplicity, the ones from the objective function are being reused.
     # TODO(kAIto47802): Think of a better way to handle this.
     lengthscales = acqf.length_scales[continuous_indices]
-
     choices_of_discrete_params = acqf.search_space.get_choices_of_discrete_params()
 
     discrete_xtols = [
@@ -206,45 +313,77 @@ def local_search_mixed(
         for choices in choices_of_discrete_params
     ]
 
-    best_normalized_params = initial_normalized_params.copy()
-    best_fval = float(acqf.eval_acqf_no_grad(best_normalized_params))
+    best_normalized_params_batched = initial_normalized_params_batched.copy()
+    best_fvals = np.array(
+        [float(acqf.eval_acqf_no_grad(p)) for p in best_normalized_params_batched]
+    )
 
-    CONTINUOUS = -1
-    last_changed_param: int | None = None
-
+    batch_size = len(best_normalized_params_batched)
+    INITIALIZED = -1
+    CONTINUOUS = -2
+    last_changed_params = np.full(batch_size, INITIALIZED)
+    is_converged_batch = np.zeros(batch_size, dtype=bool)
     for _ in range(max_iter):
-        if last_changed_param == CONTINUOUS:
-            # Parameters not changed since last time.
-            return best_normalized_params, best_fval
-        (best_normalized_params, best_fval, updated) = _gradient_ascent(
+        is_converged_batch[last_changed_params == CONTINUOUS] = True
+        if is_converged_batch.all():
+            return best_normalized_params_batched, best_fvals
+
+        (params, fvals, updated) = _gradient_ascent_batched(
             acqf,
-            best_normalized_params,
-            best_fval,
+            best_normalized_params_batched[~is_converged_batch],
+            best_fvals[~is_converged_batch],
             continuous_indices,
             lengthscales,
             tol,
         )
-        if updated:
-            last_changed_param = CONTINUOUS
+
+        assert (
+            len(params)
+            == len(fvals)
+            == len(updated)
+            == len(best_normalized_params_batched) - is_converged_batch.sum()
+        )
+
+        best_normalized_params_batched[~is_converged_batch] = params
+        best_fvals[~is_converged_batch] = fvals
+        last_changed_params[~is_converged_batch] = np.where(
+            updated, CONTINUOUS, last_changed_params[~is_converged_batch]
+        )
 
         for i, choices, xtol in zip(
             acqf.search_space.discrete_indices, choices_of_discrete_params, discrete_xtols
         ):
-            if last_changed_param == i:
-                # Parameters not changed since last time.
-                return best_normalized_params, best_fval
-            (best_normalized_params, best_fval, updated) = _local_search_discrete(
-                acqf, best_normalized_params, best_fval, i, choices, xtol
+            is_converged_batch[last_changed_params == i] = True
+            if is_converged_batch.all():
+                return best_normalized_params_batched, best_fvals
+            (params, fvals, updated) = _local_search_discrete_batched(
+                acqf,
+                best_normalized_params_batched[~is_converged_batch],
+                best_fvals[~is_converged_batch],
+                i,
+                choices,
+                xtol,
             )
-            if updated:
-                last_changed_param = i
+            assert (
+                len(params)
+                == len(fvals)
+                == len(updated)
+                == len(best_normalized_params_batched) - is_converged_batch.sum()
+            )
 
-        if last_changed_param is None:
-            # Parameters not changed from the beginning.
-            return best_normalized_params, best_fval
+            best_normalized_params_batched[~is_converged_batch] = params
+            best_fvals[~is_converged_batch] = fvals
+            last_changed_params[~is_converged_batch] = np.where(
+                updated, i, last_changed_params[~is_converged_batch]
+            )
 
-    _logger.warning("local_search_mixed: Local search did not converge.")
-    return best_normalized_params, best_fval
+        # Parameters not changed from the beginning.
+        is_converged_batch[last_changed_params == INITIALIZED] = True
+        if is_converged_batch.all():
+            return best_normalized_params_batched, best_fvals
+    else:
+        _logger.warning("local_search_mixed: Local search did not converge.")
+    return best_normalized_params_batched, best_fvals
 
 
 def optimize_acqf_mixed(
@@ -256,15 +395,14 @@ def optimize_acqf_mixed(
     tol: float = 1e-4,
     rng: np.random.RandomState | None = None,
 ) -> tuple[np.ndarray, float]:
-
     rng = rng or np.random.RandomState()
 
     if warmstart_normalized_params_array is None:
         warmstart_normalized_params_array = np.empty((0, acqf.search_space.dim))
 
-    assert (
-        len(warmstart_normalized_params_array) <= n_local_search - 1
-    ), "We must choose at least 1 best sampled point + given_initial_xs as start points."
+    assert len(warmstart_normalized_params_array) <= n_local_search - 1, (
+        "We must choose at least 1 best sampled point + given_initial_xs as start points."
+    )
 
     sampled_xs = acqf.search_space.sample_normalized_params(n_preliminary_samples, rng=rng)
 
@@ -297,10 +435,7 @@ def optimize_acqf_mixed(
     best_x = sampled_xs[max_i, :]
     best_f = float(f_vals[max_i])
 
-    for x_warmstart in np.vstack([sampled_xs[chosen_idxs, :], warmstart_normalized_params_array]):
-        x, f = local_search_mixed(acqf, x_warmstart, tol=tol)
-        if f > best_f:
-            best_x = x
-            best_f = f
-
-    return best_x, best_f
+    x_warmstarts = np.vstack([sampled_xs[chosen_idxs, :], warmstart_normalized_params_array])
+    xs, fvals = local_search_mixed_batched(acqf, x_warmstarts, tol=tol)
+    best_idx = np.argmax(fvals).item()
+    return xs[best_idx], fvals[best_idx]
