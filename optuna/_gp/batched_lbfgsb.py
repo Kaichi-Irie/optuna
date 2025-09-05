@@ -1,12 +1,36 @@
-# %%
-
 import numpy as np
 import scipy.optimize as so
 from greenlet import greenlet
 
+from optuna._gp.acqf import BaseAcquisitionFunc
+
+
+class BatchEvaluatedAcquisitionFunc(BaseAcquisitionFunc):
+    def __init__(self, acqf: BaseAcquisitionFunc) -> None:
+        super().__init__(
+            acqf.length_scales,
+            acqf.search_space,
+        )
+        self._acqf = acqf
+
+    def eval_acqf(self, x: "torch.Tensor") -> "torch.Tensor":
+        raise NotImplementedError(
+            "BatchEvaluatedAcquisitionFunc.eval_acqf is not implemented. "
+            "Please use eval_acqf_no_grad or eval_acqf_with_grad."
+        )
+
+    def eval_acqf_no_grad(self, x: np.ndarray) -> np.ndarray:
+        fval = greenlet.getcurrent().parent.switch((False, x))
+        return fval
+
+    def eval_acqf_with_grad(self, x: np.ndarray, *args) -> tuple[np.ndarray, np.ndarray]:
+        fval, grad = greenlet.getcurrent().parent.switch((True, x, *args))
+        return fval, grad
+
 
 def batched_lbfgsb(
     func_and_grad,
+    acqf,
     x0_batched: np.ndarray,
     bounds: np.ndarray,
     pgtol: float,
@@ -19,6 +43,7 @@ def batched_lbfgsb(
     x_opts = [None] * batch_size
     fval_opts = [None] * batch_size
     n_iterations = [None] * batch_size
+    acqf_wrapper = BatchEvaluatedAcquisitionFunc(acqf)
 
     def run(i: int) -> None:
         # This wrapper will be passed to fmin_l_bfgs_b.
@@ -26,9 +51,9 @@ def batched_lbfgsb(
         def func(x: np.ndarray, *args) -> tuple[float, np.ndarray]:
             assert x.shape == (dimension,)
             # Pass the current point `x` and its original index `i` to the parent greenlet.
-            y, grad = greenlet.getcurrent().parent.switch((x, i))
+            y, grad = acqf_wrapper.eval_acqf_with_grad(x, i)
             assert grad.shape == (dimension,)
-            return y, grad
+            return y.item(), grad
 
         x_opt, fval_opt, info = so.fmin_l_bfgs_b(
             func=func,
@@ -57,7 +82,7 @@ def batched_lbfgsb(
 
     while len(requests) > 0:
         # Unzip requests into points and their original indices
-        xs, unconverged_indices = zip(*requests)
+        _, xs, unconverged_indices = zip(*requests)
         unconverged_indices = np.array(unconverged_indices)
 
         # Batch evaluation
